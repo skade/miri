@@ -886,7 +886,7 @@ impl<'a, 'tcx> EvalContext<'a, 'tcx> {
 
             "mmap" => {
                 // This is a horrible hack, but well... the guard page mechanism calls mmap and expects a particular return value, so we give it that value
-                let addr = args[0].read_ptr(&self.memory)?;
+                let addr = args[0].into_ptr(&mut self.memory)?;
                 self.write_ptr(dest, addr, dest_ty)?;
             }
 

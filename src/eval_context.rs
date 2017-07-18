@@ -45,9 +45,13 @@ pub struct EvalContext<'a, 'tcx: 'a> {
     /// Environment variables set by `setenv`
     /// Miri does not expose env vars from the host to the emulated program
     pub(crate) env_vars: HashMap<Vec<u8>, MemoryPointer>,
+
+    /// Listeners for execution context events
+    pub(crate) listeners: Vec<Box<Listener<'a, 'tcx>>>
 }
 
 /// A stack frame.
+#[derive(Debug)]
 pub struct Frame<'tcx> {
     ////////////////////////////////////////////////////////////////////////////////
     // Function and callsite information
@@ -112,6 +116,15 @@ pub enum StackPopCleanup {
     None,
 }
 
+pub trait Listener<'a, 'tcx: 'a> {
+    fn before_memory_allocation(&self, ty: Ty<'tcx>, memory: &Memory<'a, 'tcx>);
+    fn after_memory_allocation(&self, ty: Ty<'tcx>, memory: &Memory<'a, 'tcx>, result: &EvalResult<'tcx, MemoryPointer>);
+    fn before_memory_write(&self, memory: &Memory<'a, 'tcx>);
+    fn after_memory_write(&self, memory: &Memory<'a, 'tcx>, result: &EvalResult<'tcx>);
+    fn on_stack_frame_push(&self, stack: &[Frame<'tcx>]);
+    fn on_stack_frame_pop(&self, stack: &[Frame<'tcx>]);
+}
+
 #[derive(Copy, Clone, Debug)]
 pub struct ResourceLimits {
     pub memory_size: u64,
@@ -139,6 +152,7 @@ impl<'a, 'tcx> EvalContext<'a, 'tcx> {
             stack_limit: limits.stack_limit,
             steps_remaining: limits.step_limit,
             env_vars: HashMap::new(),
+            listeners: vec![]
         }
     }
 
@@ -152,9 +166,19 @@ impl<'a, 'tcx> EvalContext<'a, 'tcx> {
         ty: Ty<'tcx>,
         substs: &'tcx Substs<'tcx>
     ) -> EvalResult<'tcx, MemoryPointer> {
+        for listener in self.listeners.iter() {
+            listener.before_memory_allocation(ty, &self.memory)
+        }
+
         let size = self.type_size_with_substs(ty, substs)?.expect("cannot alloc memory for unsized type");
         let align = self.type_align_with_substs(ty, substs)?;
-        self.memory.allocate(size, align)
+        let res = self.memory.allocate(size, align);
+
+        for listener in self.listeners.iter() {
+            listener.after_memory_allocation(ty, &self.memory, &res)
+        }
+
+        res
     }
 
     pub fn memory(&self) -> &Memory<'a, 'tcx> {
@@ -336,6 +360,10 @@ impl<'a, 'tcx> EvalContext<'a, 'tcx> {
             stmt: 0,
         });
 
+        for listener in self.listeners.iter() {
+            listener.on_stack_frame_push(&self.stack);
+        }
+
         if self.stack.len() > self.stack_limit {
             Err(EvalError::StackFrameLimitReached)
         } else {
@@ -404,6 +432,10 @@ impl<'a, 'tcx> EvalContext<'a, 'tcx> {
         // deallocate all locals that are backed by an allocation
         for local in frame.locals {
             self.deallocate_local(local)?;
+        }
+
+        for listener in self.listeners.iter() {
+            listener.on_stack_frame_pop(&self.stack);
         }
 
         Ok(())
@@ -1102,11 +1134,14 @@ impl<'a, 'tcx> EvalContext<'a, 'tcx> {
         dest: Lvalue<'tcx>,
         dest_ty: Ty<'tcx>,
     ) -> EvalResult<'tcx> {
+        for listener in self.listeners.iter() {
+            listener.before_memory_write(&self.memory)
+        }
         // Note that it is really important that the type here is the right one, and matches the type things are read at.
         // In case `src_val` is a `ByValPair`, we don't do any magic here to handle padding properly, which is only
         // correct if we never look at this data with the wrong type.
 
-        match dest {
+        let res = match dest {
             Lvalue::Global(cid) => {
                 let dest = *self.globals.get_mut(&cid).expect("global should be cached");
                 if !dest.mutable {
@@ -1137,7 +1172,13 @@ impl<'a, 'tcx> EvalContext<'a, 'tcx> {
                     dest_ty,
                 )
             }
+        };
+
+        for listener in self.listeners.iter() {
+            listener.after_memory_write(&self.memory, &res)
         }
+
+        res
     }
 
     // The cases here can be a bit subtle. Read carefully!
@@ -1663,6 +1704,7 @@ pub fn eval_main<'a, 'tcx: 'a>(
     main_id: DefId,
     start_wrapper: Option<DefId>,
     limits: ResourceLimits,
+    mut listeners: Vec<Box<Listener<'a, 'tcx>>>,
 ) {
     fn run_main<'a, 'tcx: 'a>(
         ecx: &mut EvalContext<'a, 'tcx>,
@@ -1734,6 +1776,8 @@ pub fn eval_main<'a, 'tcx: 'a>(
     }
 
     let mut ecx = EvalContext::new(tcx, limits);
+    ecx.listeners.append(&mut listeners);
+
     match run_main(&mut ecx, main_id, start_wrapper) {
         Ok(()) => {
             let leaks = ecx.memory.leak_report();
